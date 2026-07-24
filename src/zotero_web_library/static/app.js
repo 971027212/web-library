@@ -119,6 +119,13 @@ const state = {
   retrievalGuidedMaterialTypes: new Set(["paper", "code", "model", "dataset", "benchmark", "website"]),
   retrievalGuidedCoverage: null,
   retrievalGuidedBusy: false,
+  retrievalAgentStatus: null,
+  retrievalAgentPayload: null,
+  retrievalAgentDraft: "",
+  retrievalAgentBusy: false,
+  retrievalAgentMessage: "",
+  retrievalAgentIntentDraft: null,
+  retrievalAgentIntentDirty: false,
   retrievalAiEvaluationSummary: null,
   retrievalAiEvaluationBusy: false,
   retrievalAiEvaluationStopRequested: false,
@@ -242,6 +249,7 @@ const state = {
 let retrievalBatchRefreshTimer = null;
 let retrievalSearchPollTimer = null;
 let retrievalGuidedPollTimer = null;
+let retrievalAgentPollTimer = null;
 let retrievalAiEvaluationAbortController = null;
 let retrievalAiScoringPollTimer = null;
 let retrievalQueryPlanPollTimer = null;
@@ -1531,7 +1539,8 @@ function renderRetrievalCandidates() {
         .filter(([, value]) => value)
         .map(([key, value]) => `<span>${escapeHtml(key.toUpperCase())}: ${escapeHtml(value)}</span>`)
         .join("");
-      return `<label class="retrieval-candidate">
+      const agentFeedback = renderRetrievalAgentCandidateFeedback(candidate);
+      return `<article class="retrieval-candidate">
         <input type="checkbox" data-retrieval-candidate-check="${escapeHtml(candidate.client_key)}" ${state.retrievalSelectedKeys.has(candidate.client_key) ? "checked" : ""}>
         <span class="retrieval-candidate-body">
           <span class="retrieval-title-row">
@@ -1550,10 +1559,40 @@ function renderRetrievalCandidates() {
           <span class="retrieval-meta">${escapeHtml([creators, year, venue].filter(Boolean).join(" · "))}</span>
           ${badges ? `<span class="retrieval-badges">${badges}</span>` : ""}
           ${abstract ? `<span class="retrieval-abstract">${escapeHtml(abstract.slice(0, 260))}${abstract.length > 260 ? "..." : ""}</span>` : ""}
+          ${agentFeedback}
         </span>
-      </label>`;
+      </article>`;
     }).join("")}
   </div>`;
+}
+
+function retrievalAgentCandidateId(candidate) {
+  return String(candidate?.stored_candidate_id || candidate?.candidate_id || "").trim();
+}
+
+function renderRetrievalAgentCandidateFeedback(candidate) {
+  if (normalizeRetrievalSearchRoute(state.retrievalSearchRoute) !== "agent" || !state.retrievalGuidedJobId) return "";
+  const candidateId = retrievalAgentCandidateId(candidate);
+  if (!candidateId) return "";
+  const feedback = Array.isArray(state.retrievalAgentPayload?.feedback) ? state.retrievalAgentPayload.feedback : [];
+  const current = feedback.find((item) => String(item.candidate_id || "") === candidateId);
+  const labels = {
+    irrelevant: "不相关",
+    duplicate: "重复",
+    too_old: "太旧",
+    already_known: "已看过",
+    useful_code: "代码有用",
+    accepted: "有用",
+    imported: "已采用",
+    weak_metadata: "元数据不足",
+  };
+  return `<span class="retrieval-agent-feedback">
+    <span>${current ? `已记录：${escapeHtml(labels[current.feedback_type] || current.feedback_type)}` : "这条资料符合需求吗？"}</span>
+    <select data-agent-candidate-feedback="${escapeHtml(candidateId)}" aria-label="候选反馈">
+      <option value="">选择反馈</option>
+      ${Object.entries(labels).map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}
+    </select>
+  </span>`;
 }
 
 function selectedRetrievalCandidates() {
@@ -3118,7 +3157,7 @@ function retrievalSearchRouteLabel(route) {
   return {
     keyword: "主题词检索",
     natural_language: "自然语言检索",
-    agent: "智能体检索（实验）",
+    agent: "智能体检索",
   }[normalizeRetrievalSearchRoute(route)];
 }
 
@@ -3142,12 +3181,12 @@ function retrievalSearchRouteConfig(route, aiConfigured) {
       status: "精准检索",
     },
     agent: {
-      title: "智能体检索（实验）",
-      subtitle: "通过 Codex skill/CLI 多轮检索，不自动导入。",
-      inputLabel: "智能体任务",
-      placeholder: "例如：机器人相关顶会，强调双臂操作，补充代码和数据集",
-      action: "查看入口",
-      status: "Skill/CLI",
+      title: "智能体检索",
+      subtitle: "通过持续对话理解需求，确认计划后调用真实多源接口检索。",
+      inputLabel: "告诉智能体你的目标",
+      placeholder: "例如：我要复现推测解码，优先找有代码和公开 benchmark 的近三年论文",
+      action: "发送",
+      status: "Codex Agent",
     },
   };
   return configs[normalized];
@@ -3300,20 +3339,281 @@ function renderRetrievalGuidedPlanEditor() {
 }
 
 function renderAgentRetrievalPanel() {
-  return `<section class="retrieval-agent-panel">
-    <div>
-      <strong>实验功能：网页端暂未启动 agent</strong>
-      <span>当前已具备 Codex skill 和 JSON CLI，后续可接入网页端对话式智能体。</span>
+  const payload = state.retrievalAgentPayload || {};
+  const agentState = payload.agent_state || {};
+  const thread = agentState.thread || {};
+  const latestTurn = payload.latest_turn || {};
+  const job = payload.job || state.retrievalGuidedJob;
+  const status = state.retrievalAgentStatus || {};
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  const emptyTask = job?.options?.empty_task === true;
+  const turnBusy = ["queued", "running"].includes(String(latestTurn.status || ""))
+    || String(thread.thread_status || "") === "running";
+  const selectedSourceNames = uniqueRetrievalSources(job?.sources || [...state.retrievalSources]);
+  const selectedSourcePreview = selectedSourceNames.slice(0, 4).map(retrievalSourceLabel).join(" / ");
+  const selectedSourceSummary = selectedSourceNames.length
+    ? `${selectedSourceNames.length} 个源：${selectedSourcePreview}${selectedSourceNames.length > 4 ? " ..." : ""}`
+    : "尚未选择数据源";
+  const sendActionLabel = state.retrievalAgentBusy
+    ? "发送中..."
+    : status.ready === false
+      ? "检查配置并发送"
+      : "发送给智能体";
+  return `<section class="retrieval-agent-workbench" data-retrieval-agent-workbench>
+    <header class="retrieval-agent-header">
+      <div>
+        <strong>智能体检索</strong>
+        <span>先对话形成任务记忆；只有确认检索计划后，后端才会联网。</span>
+      </div>
+      <div class="retrieval-agent-header-actions">
+        ${job ? `<button type="button" class="mini-icon retrieval-report-btn" data-agent-new-task>新建任务</button>` : ""}
+        <span class="retrieval-agent-thread-status">${escapeHtml(retrievalAgentThreadStatusLabel(thread.thread_status || (job ? "waiting_user" : "created")))}</span>
+      </div>
+    </header>
+    ${renderRetrievalSearchRouteTabs(state.retrievalModelStatus?.configured === true)}
+    ${renderRetrievalAgentStatusBanner()}
+    <div class="retrieval-agent-layout">
+      <section class="retrieval-agent-chat" aria-label="与智能体对话">
+        <div class="retrieval-agent-section-head">
+          <div>
+            <strong>对话</strong>
+            <span>智能体会先追问关键条件；回答后再形成检索计划。</span>
+          </div>
+        </div>
+        <div class="retrieval-agent-messages" data-agent-messages>
+          ${messages.length ? messages.map(renderRetrievalAgentMessage).join("") : `
+            <div class="retrieval-agent-empty">
+              <strong>${emptyTask ? "新对话已创建" : "从研究目标开始"}</strong>
+              <span>${emptyTask ? "请描述这次要检索的内容，智能体会先向你提问。" : "可以说用途、时间、资料类型、必须包含和不要包含什么。"}</span>
+            </div>`}
+          ${turnBusy ? `<div class="retrieval-agent-thinking"><span></span>正在理解这轮要求...</div>` : ""}
+        </div>
+        <form class="retrieval-agent-composer" data-agent-chat-form>
+          <textarea name="message" data-agent-message-input rows="4" placeholder="例如：我要做复现，必须有公开代码；不要医学方向。">${escapeHtml(state.retrievalAgentDraft)}</textarea>
+          <div>
+            <span>${job ? escapeHtml(selectedSourceSummary) : "首次发送时创建任务"}</span>
+            <div class="retrieval-agent-composer-actions">
+              ${turnBusy ? `<button type="button" class="mini-icon retrieval-report-btn danger" data-agent-interrupt>中断</button>` : ""}
+              <button type="submit" class="form-action-btn" ${turnBusy || state.retrievalAgentBusy ? "disabled" : ""}>${sendActionLabel}</button>
+            </div>
+          </div>
+        </form>
+        ${state.retrievalAgentMessage ? `<p class="retrieval-source-message">${escapeHtml(state.retrievalAgentMessage)}</p>` : ""}
+      </section>
+
+      ${renderRetrievalAgentCandidateBoard()}
+
+      <aside class="retrieval-agent-context" aria-label="任务理解与记忆">
+        ${renderRetrievalAgentPendingAction(agentState, job)}
+        ${renderRetrievalAgentIntentPanel(agentState)}
+        ${renderRetrievalAgentCoveragePanel(agentState)}
+        ${renderRetrievalAgentMemoryPanel(payload.memory)}
+      </aside>
     </div>
-    <div class="retrieval-agent-grid">
-      <span>会读取历史要求并持续修正检索目标</span>
-      <span>会循环调用多源检索 CLI 获取候选</span>
-      <span>会输出候选表和覆盖缺口</span>
-      <span>不会自动导入 Zotero</span>
-    </div>
-    <code>.venv\\Scripts\\python.exe -m zotero_web_library.retrieval_cli plan --route natural_language --input "你的需求"</code>
-    <code>skills/multi-source-retrieval/SKILL.md</code>
+    ${!job ? renderRetrievalAgentSetup(selectedSourceSummary) : `
+      <details class="retrieval-agent-task-settings">
+        <summary><strong>本任务检索边界</strong><span>${escapeHtml(selectedSourceSummary)}</span></summary>
+        <p>数据源是本任务的硬约束。需要更换数据源时，请新建任务。</p>
+      </details>`}
   </section>`;
+}
+
+function retrievalAgentThreadStatusLabel(status) {
+  return {
+    created: "尚未开始",
+    running: "正在理解",
+    waiting_user: "等待补充",
+    waiting_approval: "等待确认",
+    searching: "正在联网检索",
+    completed: "任务已完成",
+    interrupted: "已中断",
+    failed: "处理失败",
+  }[String(status || "")] || "等待输入";
+}
+
+function renderRetrievalAgentStatusBanner() {
+  const status = state.retrievalAgentStatus;
+  if (!status) {
+    return `<div class="retrieval-agent-status checking"><span>正在检查 Codex...</span></div>`;
+  }
+  const ready = status.ready === true;
+  return `<div class="retrieval-agent-status ${ready ? "ready" : "failed"}">
+    <div>
+      <strong>${ready ? "Codex 已就绪" : "Codex 未就绪"}</strong>
+      <span>${escapeHtml(status.message || (ready ? "可以开始对话。" : "请先完成 Codex 配置。"))}</span>
+    </div>
+    <div>
+      ${ready && status.model ? `<span>${escapeHtml(status.model)}</span>` : `<a href="/library/${encodeURIComponent(state.libraryId)}/api-config">配置当前文库</a>`}
+      <button type="button" class="mini-icon retrieval-report-btn" data-agent-check-status>${state.retrievalAgentBusy ? "检查中..." : "重新检查"}</button>
+    </div>
+  </div>`;
+}
+
+function renderRetrievalAgentMessage(message) {
+  const role = String(message?.role || "system");
+  const labels = { user: "你", assistant: "智能体", system: "系统" };
+  return `<article class="retrieval-agent-message ${escapeHtml(role)}">
+    <span>${escapeHtml(labels[role] || role)}</span>
+    <p>${escapeHtml(message?.content || "")}</p>
+    ${message?.created_at ? `<time>${escapeHtml(formatRetrievalTime(message.created_at))}</time>` : ""}
+  </article>`;
+}
+
+function renderRetrievalAgentCandidateBoard() {
+  const selectedCount = selectedRetrievalCandidates().length;
+  const candidateCount = state.retrievalCandidates.length;
+  const candidateHtml = renderRetrievalCandidates();
+  const job = state.retrievalAgentPayload?.job || state.retrievalGuidedJob;
+  const active = retrievalBackgroundJobIsActive(job);
+  return `<section class="retrieval-agent-candidates simple-candidate-board" aria-label="候选池">
+    <div class="retrieval-agent-section-head">
+      <div>
+        <strong>候选池</strong>
+        <span>${active ? `正在检索，已发现 ${candidateCount} 条` : candidateCount ? `${candidateCount} 条候选` : "确认计划后，结果会逐条出现"}</span>
+      </div>
+      ${candidateCount ? `<div class="simple-result-tools">
+        <button type="button" class="mini-icon retrieval-report-btn" data-select-retrieval-candidates="all">全选</button>
+        <button type="button" class="mini-icon retrieval-report-btn" data-select-retrieval-candidates="none">清空</button>
+        <button type="button" class="mini-icon retrieval-report-btn danger" data-delete-selected-retrieval-candidates ${selectedCount ? "" : "disabled"}>删除所选</button>
+      </div>` : ""}
+    </div>
+    ${renderGuidedSearchStatus()}
+    ${renderRetrievalStats()}
+    ${candidateHtml || `<div class="retrieval-agent-empty"><strong>还没有候选</strong><span>先通过对话让智能体理解需求，再确认它提出的检索计划。</span></div>`}
+    <div class="retrieval-actions simple-import-actions">
+      <span>已选择 ${selectedCount} 条</span>
+      <button type="button" class="form-action-btn" data-import-retrieval-selected ${state.addItemBusy || !selectedCount ? "disabled" : ""}>导入所选</button>
+    </div>
+  </section>`;
+}
+
+function renderRetrievalAgentPendingAction(agentState, job) {
+  const actions = Array.isArray(agentState?.pending_actions) ? agentState.pending_actions : [];
+  const action = [...actions].reverse().find((item) => item.status === "pending");
+  if (!action) return "";
+  const plan = action.plan_preview || {};
+  const queryIntents = Array.isArray(plan.query_intents) ? plan.query_intents : [];
+  const active = retrievalBackgroundJobIsActive(job);
+  return `<section class="retrieval-agent-side-section pending">
+    <div class="retrieval-agent-section-head">
+      <div><strong>待确认检索</strong><span>${Number(action.estimated_cost?.query_count || 0)} 条检索词</span></div>
+    </div>
+    <p>${escapeHtml(plan.target || action.reason || "智能体已准备好一轮检索计划。")}</p>
+    <div class="retrieval-agent-plan-list">
+      ${queryIntents.map((item) => `<div>
+        <strong>${escapeHtml(guidedMaterialLabel(item.material_type || "paper"))} · ${escapeHtml(item.purpose || "检索")}</strong>
+        <span>${escapeHtml((item.keywords || []).join(" / "))}</span>
+      </div>`).join("")}
+    </div>
+    <div class="retrieval-agent-side-actions">
+      <button type="button" class="form-action-btn" data-agent-approve="${escapeHtml(action.action_id || "")}" ${active ? "disabled" : ""}>${active ? "等待当前轮完成" : "确认并开始检索"}</button>
+      <button type="button" class="mini-icon retrieval-report-btn" data-agent-reject="${escapeHtml(action.action_id || "")}">暂不检索</button>
+    </div>
+  </section>`;
+}
+
+function renderRetrievalAgentIntentPanel(agentState) {
+  const intent = state.retrievalAgentIntentDirty && state.retrievalAgentIntentDraft
+    ? state.retrievalAgentIntentDraft
+    : agentState?.intent_model || {};
+  const timeRange = intent.time_range || {};
+  const goals = {
+    mixed: "综合",
+    survey: "综述调研",
+    implementation: "复现实现",
+    innovation: "寻找创新点",
+    benchmark: "基准评测",
+    citation: "引用查找",
+    dataset: "数据集",
+    model: "模型",
+  };
+  const materials = new Set(Array.isArray(intent.material_types) ? intent.material_types : []);
+  return `<section class="retrieval-agent-side-section">
+    <div class="retrieval-agent-section-head">
+      <div><strong>当前理解</strong><span>可直接修改，保存后写入任务记忆。</span></div>
+    </div>
+    <form class="retrieval-agent-intent-form" data-agent-intent-form>
+      <label><span>研究目标</span><select name="research_goal">${Object.entries(goals).map(([value, label]) => `<option value="${value}" ${intent.research_goal === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+      <label><span>归一化主题</span><input name="normalized_topic" value="${escapeHtml(intent.normalized_topic || intent.topic || "")}" placeholder="例如 speculative decoding reproducibility"></label>
+      <label><span>必须包含</span><textarea name="must_include" rows="2" placeholder="每行一项">${escapeHtml((intent.must_include || []).join("\n"))}</textarea></label>
+      <label><span>排除条件</span><textarea name="exclude_terms" rows="2" placeholder="每行一项">${escapeHtml((intent.exclude_terms || []).join("\n"))}</textarea></label>
+      <label><span>质量偏好</span><textarea name="quality_criteria" rows="2" placeholder="例如：优先顶会、有公开代码">${escapeHtml((intent.quality_criteria || []).join("\n"))}</textarea></label>
+      <div class="retrieval-agent-year-row">
+        <label><span>起始年份</span><input type="number" name="start_year" min="1800" max="2200" value="${escapeHtml(timeRange.start_year || "")}"></label>
+        <label><span>结束年份</span><input type="number" name="end_year" min="1800" max="2200" value="${escapeHtml(timeRange.end_year || "")}"></label>
+      </div>
+      <div class="retrieval-agent-materials">
+        ${["paper", "code", "model", "dataset", "benchmark", "website"].map((value) => `<label>
+          <input type="checkbox" name="material_types" value="${value}" ${materials.has(value) ? "checked" : ""}>
+          <span>${escapeHtml(guidedMaterialLabel(value))}</span>
+        </label>`).join("")}
+      </div>
+      <button type="button" class="mini-icon retrieval-report-btn" data-agent-save-intent ${state.retrievalGuidedJobId ? "" : "disabled"}>保存当前理解</button>
+    </form>
+  </section>`;
+}
+
+function renderRetrievalAgentCoveragePanel(agentState) {
+  const coverage = agentState?.coverage_state || {};
+  const score = Math.round(Number(coverage.overall_score || 0) * 100);
+  const gaps = Array.isArray(coverage.gaps) ? coverage.gaps : [];
+  const material = coverage.by_material_type || {};
+  const materialRows = Object.entries(material)
+    .filter(([, count]) => Number(count || 0) > 0)
+    .map(([name, count]) => `<span>${escapeHtml(guidedMaterialLabel(name))} ${Number(count)}</span>`)
+    .join("");
+  return `<section class="retrieval-agent-side-section">
+    <div class="retrieval-agent-section-head">
+      <div><strong>覆盖情况</strong><span>${score ? `覆盖度 ${score}%` : "等待首轮检索"}</span></div>
+    </div>
+    ${materialRows ? `<div class="retrieval-agent-coverage-counts">${materialRows}</div>` : ""}
+    ${gaps.length ? `<div class="retrieval-agent-gap-list">${gaps.slice(0, 6).map((gap) => `<span>${escapeHtml(gap)}</span>`).join("")}</div>` : `<p>暂无明确覆盖缺口。</p>`}
+  </section>`;
+}
+
+function retrievalAgentMemoryText(memory) {
+  const content = memory?.content && typeof memory.content === "object" ? memory.content : {};
+  if (content.summary) return String(content.summary);
+  return Object.entries(content).map(([key, value]) => `${key}：${Array.isArray(value) ? value.join("、") : value}`).join("；");
+}
+
+function renderRetrievalAgentMemoryPanel(memoryValue) {
+  const memory = Array.isArray(memoryValue) ? memoryValue : [];
+  return `<section class="retrieval-agent-side-section">
+    <div class="retrieval-agent-section-head">
+      <div><strong>跨任务记忆</strong><span>只有你确认启用后，未来任务才会使用。</span></div>
+    </div>
+    <div class="retrieval-agent-memory-list">
+      ${memory.length ? memory.map((item) => `<div>
+        <span>${escapeHtml(retrievalAgentMemoryText(item))}</span>
+        <div>
+          ${item.status === "suggested" ? `<button type="button" class="mini-icon retrieval-report-btn" data-agent-memory-status="${escapeHtml(item.memory_id)}" data-status="enabled">记住</button>` : ""}
+          ${item.status === "enabled" ? `<button type="button" class="mini-icon retrieval-report-btn" data-agent-memory-status="${escapeHtml(item.memory_id)}" data-status="disabled">停用</button>` : ""}
+          ${item.status === "disabled" ? `<button type="button" class="mini-icon retrieval-report-btn" data-agent-memory-status="${escapeHtml(item.memory_id)}" data-status="enabled">启用</button>` : ""}
+          <button type="button" class="mini-icon retrieval-report-btn danger" data-agent-memory-delete="${escapeHtml(item.memory_id)}">删除</button>
+        </div>
+      </div>`).join("") : `<p>暂无记忆建议。</p>`}
+    </div>
+  </section>`;
+}
+
+function renderRetrievalAgentSetup(selectedSourceSummary) {
+  return `<details class="retrieval-agent-task-settings" open>
+    <summary><strong>新任务检索边界</strong><span>${escapeHtml(selectedSourceSummary)}</span></summary>
+    <div class="retrieval-agent-task-settings-body">
+      ${renderGuidedSearchControls(state.retrievalModelStatus?.configured === true)}
+      ${renderGuidedSourceLimits()}
+      <details class="simple-source-drawer">
+        <summary><strong>数据源</strong><span>${escapeHtml(selectedSourceSummary)}</span></summary>
+        <div class="simple-source-head">
+          <div><strong>选择允许智能体使用的数据源</strong></div>
+          <button type="button" class="mini-icon" data-check-retrieval-sources title="刷新数据源状态">${state.retrievalSourcesChecking ? "..." : "↻"}</button>
+        </div>
+        <div class="simple-source-categories">${simpleRetrievalSourceCategories().map(renderSimpleRetrievalSourceCategory).join("")}</div>
+        ${renderRetrievalSourceManager()}
+      </details>
+    </div>
+  </details>`;
 }
 
 function renderGuidedJobPlanPreview() {
@@ -3353,6 +3653,7 @@ function renderSimpleRetrievalMain() {
     : "未选择数据源";
   const aiConfigured = state.retrievalModelStatus?.configured === true;
   const activeRoute = normalizeRetrievalSearchRoute(state.retrievalSearchRoute);
+  if (activeRoute === "agent") return renderAgentRetrievalPanel();
   const routeConfig = retrievalSearchRouteConfig(activeRoute, aiConfigured);
   const hasAiScoring = ["ai_model", "mixed_ai_rules"].includes(aiSummarySource);
   const aiScoreButtonText = state.retrievalAiEvaluationBusy
@@ -3378,7 +3679,6 @@ function renderSimpleRetrievalMain() {
         </label>
         ${renderGuidedSearchControls(aiConfigured)}
         ${renderGuidedSourceLimits()}
-        ${activeRoute === "agent" ? renderAgentRetrievalPanel() : ""}
         <div class="simple-composer-actions">
           ${renderRetrievalGuidedActionButtons(activeRoute, submitBusy, guidedActive)}
           <span>${escapeHtml(selectedSourceSummary)}</span>
@@ -3751,6 +4051,10 @@ function bindRetrievalPageEvents(host) {
   host.addEventListener("submit", (event) => {
     if (!event.target.matches("form")) return;
     const delegatedEvent = delegatedRetrievalSubmitEvent(event);
+    if (event.target.matches("[data-agent-chat-form]")) {
+      submitRetrievalAgentMessage(delegatedEvent);
+      return;
+    }
     if (event.target.matches("[data-retrieval-search-form]")) submitRetrievalSearch(delegatedEvent);
     else if (event.target.matches("[data-retrieval-local-paths-form]")) saveRetrievalLocalPaths(delegatedEvent);
     else if (event.target.matches("[data-retrieval-http-json-form]")) saveRetrievalHttpJsonConfig(delegatedEvent);
@@ -3759,7 +4063,12 @@ function bindRetrievalPageEvents(host) {
     else if (event.target.matches("[data-retrieval-batch-form]")) submitRetrievalBatch(delegatedEvent);
   });
   host.addEventListener("input", (event) => {
-    if (event.target.matches("[data-retrieval-query-input]")) {
+    if (event.target.matches("[data-agent-message-input]")) {
+      state.retrievalAgentDraft = String(event.target.value || "");
+    } else if (event.target.closest("[data-agent-intent-form]")) {
+      state.retrievalAgentIntentDraft = retrievalAgentIntentFromForm(event.target.closest("[data-agent-intent-form]"));
+      state.retrievalAgentIntentDirty = true;
+    } else if (event.target.matches("[data-retrieval-query-input]")) {
       const nextQuery = String(event.target.value || "").trim();
       if (nextQuery !== state.retrievalQuery) {
         state.retrievalQuery = nextQuery;
@@ -3808,7 +4117,14 @@ function bindRetrievalPageEvents(host) {
     }
   });
   host.addEventListener("change", (event) => {
-    if (event.target.matches("[data-retrieval-query-plan-ai]")) {
+    if (event.target.matches("[data-agent-candidate-feedback]")) {
+      const candidateId = String(event.target.dataset.agentCandidateFeedback || "");
+      const feedbackType = String(event.target.value || "");
+      if (candidateId && feedbackType) submitRetrievalAgentFeedback(candidateId, feedbackType);
+    } else if (event.target.closest("[data-agent-intent-form]")) {
+      state.retrievalAgentIntentDraft = retrievalAgentIntentFromForm(event.target.closest("[data-agent-intent-form]"));
+      state.retrievalAgentIntentDirty = true;
+    } else if (event.target.matches("[data-retrieval-query-plan-ai]")) {
       state.retrievalQueryPlanUseAi = Boolean(event.target.checked);
       state.retrievalQueryPlan = null;
       renderRetrievalPage();
@@ -3850,7 +4166,15 @@ function bindRetrievalPageEvents(host) {
   host.addEventListener("click", (event) => {
     const button = event.target.closest("button");
     if (!button || !host.contains(button)) return;
-    if (button.matches("[data-clear-retrieval-local-paths]")) clearRetrievalLocalPaths();
+    if (button.matches("[data-agent-check-status]")) loadRetrievalAgentStatus({ check: true });
+    else if (button.matches("[data-agent-new-task]")) startNewRetrievalAgentTask();
+    else if (button.matches("[data-agent-interrupt]")) interruptRetrievalAgent();
+    else if (button.matches("[data-agent-save-intent]")) saveRetrievalAgentIntent();
+    else if (button.matches("[data-agent-approve]")) decideRetrievalAgentPlan(button.dataset.agentApprove, "approve");
+    else if (button.matches("[data-agent-reject]")) decideRetrievalAgentPlan(button.dataset.agentReject, "reject");
+    else if (button.matches("[data-agent-memory-status]")) updateRetrievalAgentMemory(button.dataset.agentMemoryStatus, button.dataset.status);
+    else if (button.matches("[data-agent-memory-delete]")) deleteRetrievalAgentMemory(button.dataset.agentMemoryDelete);
+    else if (button.matches("[data-clear-retrieval-local-paths]")) clearRetrievalLocalPaths();
     else if (button.matches("[data-suggest-retrieval-local-field-map]")) suggestRetrievalLocalFieldMap();
     else if (button.matches("[data-refresh-retrieval-local-preview]")) loadRetrievalLocalPreview();
     else if (button.matches("[data-retrieval-config-bundle-input]")) return;
@@ -3873,7 +4197,22 @@ function bindRetrievalPageEvents(host) {
       resetRetrievalGuidedPlanDraft();
       state.retrievalQueryPlan = null;
       state.retrievalBatchQueries = "";
+      if (state.retrievalSearchRoute !== "agent" && retrievalAgentPollTimer) {
+        clearTimeout(retrievalAgentPollTimer);
+        retrievalAgentPollTimer = null;
+      }
       renderRetrievalPage();
+      if (state.retrievalSearchRoute === "agent") {
+        loadRetrievalAgentStatus({ silent: true });
+        const currentRoute = normalizeRetrievalSearchRoute(
+          state.retrievalGuidedJob?.search_route || state.retrievalGuidedJob?.options?.search_route
+        );
+        if (currentRoute === "agent" && state.retrievalGuidedJobId) {
+          loadRetrievalAgentState(state.retrievalGuidedJobId, { silent: true });
+        } else {
+          loadLatestRetrievalAgentJob({ silent: true });
+        }
+      }
     }
     else if (button.matches("[data-guided-search-mode]")) {
       resetRetrievalGuidedPlanDraft();
@@ -4185,11 +4524,6 @@ async function submitRetrievalSearch(event) {
     return;
   }
   const materialTypes = currentGuidedMaterialTypes();
-  if (searchRoute === "agent") {
-    state.addItemMessage = "智能体检索实验入口已在下方说明：网页端暂未启动 agent，当前可通过 Codex skill/CLI 调用。";
-    renderRetrievalSurface();
-    return;
-  }
   if (searchRoute === "natural_language" && guidedAction !== "search") {
     state.retrievalSources = new Set(selectedSources);
     await draftRetrievalGuidedSearchPlan({ query, sources, materialTypes });
@@ -4273,6 +4607,360 @@ async function submitRetrievalSearch(event) {
       state.retrievalGuidedBusy = false;
     }
     renderAddItemModal();
+  }
+}
+
+function retrievalAgentListValue(value) {
+  return String(value || "")
+    .split(/[\r\n,，;；]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function retrievalAgentIntentFromForm(form) {
+  const formData = new FormData(form);
+  const startYear = Number.parseInt(formData.get("start_year"), 10);
+  const endYear = Number.parseInt(formData.get("end_year"), 10);
+  const timeRange = {};
+  if (Number.isFinite(startYear)) timeRange.start_year = startYear;
+  if (Number.isFinite(endYear)) timeRange.end_year = endYear;
+  return {
+    research_goal: String(formData.get("research_goal") || "mixed"),
+    normalized_topic: String(formData.get("normalized_topic") || "").trim(),
+    must_include: retrievalAgentListValue(formData.get("must_include")),
+    exclude_terms: retrievalAgentListValue(formData.get("exclude_terms")),
+    quality_criteria: retrievalAgentListValue(formData.get("quality_criteria")),
+    material_types: formData.getAll("material_types").map((value) => String(value)),
+    time_range: timeRange,
+  };
+}
+
+function retrievalAgentPollIsNeeded(payload = state.retrievalAgentPayload) {
+  const turnStatus = String(payload?.latest_turn?.status || "");
+  const jobStatus = String(payload?.job?.status || "");
+  const threadStatus = String(payload?.agent_state?.thread?.thread_status || "");
+  return ["queued", "running"].includes(turnStatus)
+    || ["queued", "running"].includes(jobStatus)
+    || ["running", "searching"].includes(threadStatus);
+}
+
+function renderRetrievalAgentSurface({ preserveComposer = true } = {}) {
+  const input = document.querySelector("[data-agent-message-input]");
+  const shouldRestore = preserveComposer && input && document.activeElement === input;
+  const selectionStart = shouldRestore ? input.selectionStart : null;
+  renderRetrievalSurface();
+  if (shouldRestore) {
+    requestAnimationFrame(() => {
+      const next = document.querySelector("[data-agent-message-input]");
+      if (!next) return;
+      next.focus();
+      if (Number.isInteger(selectionStart)) next.setSelectionRange(selectionStart, selectionStart);
+    });
+  }
+}
+
+function applyRetrievalAgentPayload(payload) {
+  if (!payload || typeof payload !== "object") return;
+  state.retrievalAgentPayload = payload;
+  if (payload.job) {
+    state.retrievalQuery = String(payload.job.topic || state.retrievalQuery || "");
+    applyRetrievalGuidedJob(payload.job);
+  }
+  if (Array.isArray(payload.candidates)) {
+    state.retrievalCandidates = normalizeRetrievalCandidates(payload.candidates);
+    const candidateKeys = new Set(state.retrievalCandidates.map((candidate) => candidate.client_key).filter(Boolean));
+    state.retrievalSelectedKeys = new Set([...state.retrievalSelectedKeys].filter((key) => candidateKeys.has(key)));
+  }
+  state.retrievalStats = payload.source_stats || state.retrievalStats || {};
+  state.retrievalGuidedCoverage = payload.coverage || payload.job?.coverage || state.retrievalGuidedCoverage;
+  if (!state.retrievalAgentIntentDirty) {
+    state.retrievalAgentIntentDraft = payload.agent_state?.intent_model || null;
+  }
+  const error = String(payload.agent_state?.thread?.last_error || "");
+  if (error) state.retrievalAgentMessage = error;
+}
+
+async function loadRetrievalAgentStatus(options = {}) {
+  if (!state.libraryId) return;
+  const check = options.check === true;
+  try {
+    if (check) {
+      state.retrievalAgentBusy = true;
+      renderRetrievalAgentSurface();
+    }
+    const response = await fetch(`/api/library/${state.libraryId}/retrieval/agent/status${check ? "?check=1" : ""}`);
+    const data = await parseJSONResponse(response);
+    if (!response.ok || data.ok === false) throw new Error(data.error || "检查 Codex 状态失败。");
+    state.retrievalAgentStatus = data;
+    state.retrievalAgentMessage = data.ready ? "" : String(data.message || "");
+  } catch (error) {
+    state.retrievalAgentStatus = { ready: false, status: "error", message: error.message };
+    if (!options.silent) state.retrievalAgentMessage = error.message;
+  } finally {
+    state.retrievalAgentBusy = false;
+    renderRetrievalAgentSurface();
+  }
+}
+
+async function createRetrievalAgentJob(initialMessage, { emptyTask = false } = {}) {
+  const selectedSources = uniqueRetrievalSources([...state.retrievalSources]);
+  const unavailableSources = unavailableRetrievalSources(selectedSources);
+  const sources = availableRetrievalSources(selectedSources);
+  if (!selectedSources.length) throw new Error("请先选择智能体可以使用的数据源。");
+  if (unavailableSources.length) throw new Error(unavailableRetrievalSourceMessage(unavailableSources));
+  if (!sources.length) throw new Error("请至少选择一个可用数据源。");
+  const result = await postJSON(`/api/library/${state.libraryId}/retrieval/guided-search-jobs`, {
+    topic: initialMessage,
+    input_text: initialMessage,
+    empty_task: emptyTask,
+    search_route: "agent",
+    planner_version: "agent-v2",
+    mode: state.retrievalGuidedMode || "quality",
+    time_range: { preset: state.retrievalGuidedTimePreset || "10y" },
+    limit_per_source: currentGuidedLimitPerSource(),
+    source_limits: guidedSourceLimitsForSubmit(sources),
+    material_types: currentGuidedMaterialTypes(),
+    sources,
+    use_ai_planning: true,
+  });
+  state.retrievalCandidates = [];
+  state.retrievalSelectedKeys = new Set();
+  state.retrievalDeletedCandidateKeys = new Set();
+  state.retrievalStats = null;
+  applyRetrievalGuidedJob(result.job || null);
+  state.retrievalAgentPayload = {
+    job: result.job || null,
+    agent_state: null,
+    messages: [],
+    candidates: [],
+    memory: [],
+    feedback: [],
+  };
+  return result.job;
+}
+
+async function submitRetrievalAgentMessage(event) {
+  event.preventDefault();
+  const formData = new FormData(event.currentTarget);
+  const message = String(formData.get("message") || state.retrievalAgentDraft || "").trim();
+  state.retrievalAgentDraft = message;
+  if (!message) {
+    state.retrievalAgentMessage = "请先描述你要找什么。";
+    renderRetrievalAgentSurface();
+    return;
+  }
+  try {
+    if (state.retrievalAgentStatus?.ready !== true) {
+      await loadRetrievalAgentStatus({ check: true, silent: true });
+      if (state.retrievalAgentStatus?.ready !== true) {
+        const statusMessage = state.retrievalAgentStatus?.message || "Codex 未就绪。";
+        state.retrievalAgentMessage = `${statusMessage} 请先配置当前文库，再重新发送。`;
+        return;
+      }
+    }
+    state.retrievalAgentBusy = true;
+    state.retrievalAgentMessage = "";
+    renderRetrievalAgentSurface();
+    let jobId = String(state.retrievalGuidedJobId || "");
+    const currentJob = state.retrievalAgentPayload?.job || state.retrievalGuidedJob;
+    if (!jobId || normalizeRetrievalSearchRoute(currentJob?.search_route || currentJob?.options?.search_route) !== "agent") {
+      const job = await createRetrievalAgentJob(message);
+      jobId = String(job?.job_id || "");
+    }
+    const result = await postJSON(
+      `/api/library/${state.libraryId}/retrieval/guided-search-jobs/${encodeURIComponent(jobId)}/agent-turns`,
+      { message }
+    );
+    state.retrievalAgentDraft = "";
+    if (state.retrievalAgentPayload) {
+      state.retrievalAgentPayload.messages = [
+        ...(state.retrievalAgentPayload.messages || []),
+        result.message,
+      ].filter(Boolean);
+      state.retrievalAgentPayload.latest_turn = result.turn || null;
+    }
+    scheduleRetrievalAgentPoll(jobId, 250);
+  } catch (error) {
+    state.retrievalAgentMessage = error.message;
+  } finally {
+    state.retrievalAgentBusy = false;
+    renderRetrievalAgentSurface();
+  }
+}
+
+async function loadRetrievalAgentState(jobId, options = {}) {
+  const cleanJobId = String(jobId || "").trim();
+  if (!state.libraryId || !cleanJobId) return;
+  try {
+    const response = await fetch(
+      `/api/library/${state.libraryId}/retrieval/guided-search-jobs/${encodeURIComponent(cleanJobId)}/agent/state`
+    );
+    const data = await parseJSONResponse(response);
+    if (!response.ok || data.ok === false) throw new Error(data.error || "加载智能体任务失败。");
+    applyRetrievalAgentPayload(data);
+    if (retrievalAgentPollIsNeeded(data)) {
+      scheduleRetrievalAgentPoll(cleanJobId);
+    } else if (retrievalAgentPollTimer) {
+      clearTimeout(retrievalAgentPollTimer);
+      retrievalAgentPollTimer = null;
+    }
+  } catch (error) {
+    if (!options.silent) state.retrievalAgentMessage = error.message;
+  } finally {
+    renderRetrievalAgentSurface();
+  }
+}
+
+function scheduleRetrievalAgentPoll(jobId, delay = 1200) {
+  const cleanJobId = String(jobId || "").trim();
+  if (retrievalAgentPollTimer) clearTimeout(retrievalAgentPollTimer);
+  retrievalAgentPollTimer = null;
+  if (!cleanJobId || normalizeRetrievalSearchRoute(state.retrievalSearchRoute) !== "agent") return;
+  retrievalAgentPollTimer = setTimeout(() => loadRetrievalAgentState(cleanJobId, { silent: true }), delay);
+}
+
+async function loadLatestRetrievalAgentJob(options = {}) {
+  if (!state.libraryId) return;
+  try {
+    const response = await fetch(
+      `/api/library/${state.libraryId}/retrieval/guided-search-jobs/latest?search_route=agent`
+    );
+    const data = await parseJSONResponse(response);
+    if (!response.ok || data.ok === false) throw new Error(data.error || "加载最近智能体任务失败。");
+    const job = data.job || null;
+    if (!job) return;
+    state.retrievalQuery = String(job.topic || "");
+    applyRetrievalGuidedJob(job);
+    await loadRetrievalAgentState(job.job_id, { silent: true });
+  } catch (error) {
+    if (!options.silent) state.retrievalAgentMessage = error.message;
+  }
+}
+
+async function startNewRetrievalAgentTask() {
+  if (retrievalAgentPollTimer) clearTimeout(retrievalAgentPollTimer);
+  retrievalAgentPollTimer = null;
+  state.retrievalGuidedJobId = "";
+  state.retrievalGuidedJob = null;
+  state.retrievalGuidedCoverage = null;
+  state.retrievalAgentPayload = null;
+  state.retrievalAgentDraft = "";
+  state.retrievalAgentMessage = "";
+  state.retrievalAgentIntentDraft = null;
+  state.retrievalAgentIntentDirty = false;
+  state.retrievalCandidates = [];
+  state.retrievalSelectedKeys = new Set();
+  state.retrievalStats = null;
+  state.retrievalQuery = "";
+  state.retrievalAgentBusy = true;
+  renderRetrievalAgentSurface({ preserveComposer: false });
+  try {
+    const job = await createRetrievalAgentJob("", { emptyTask: true });
+    await loadRetrievalAgentState(job.job_id, { silent: true });
+    state.retrievalAgentMessage = "新对话已创建，请描述这次要检索的内容。";
+  } catch (error) {
+    state.retrievalAgentMessage = error.message;
+  } finally {
+    state.retrievalAgentBusy = false;
+    renderRetrievalAgentSurface({ preserveComposer: false });
+  }
+}
+
+async function saveRetrievalAgentIntent() {
+  const form = document.querySelector("[data-agent-intent-form]");
+  if (!form || !state.retrievalGuidedJobId) return;
+  try {
+    state.retrievalAgentBusy = true;
+    const intentPatch = retrievalAgentIntentFromForm(form);
+    const result = await postJSON(
+      `/api/library/${state.libraryId}/retrieval/guided-search-jobs/${encodeURIComponent(state.retrievalGuidedJobId)}/agent/intent`,
+      { intent_patch: intentPatch },
+      "PATCH"
+    );
+    state.retrievalAgentIntentDirty = false;
+    state.retrievalAgentIntentDraft = null;
+    state.retrievalAgentMessage = "当前理解已保存到本任务。";
+    applyRetrievalAgentPayload(result);
+  } catch (error) {
+    state.retrievalAgentMessage = error.message;
+  } finally {
+    state.retrievalAgentBusy = false;
+    renderRetrievalAgentSurface();
+  }
+}
+
+async function decideRetrievalAgentPlan(actionId, decision) {
+  if (!state.retrievalGuidedJobId || !actionId) return;
+  try {
+    state.retrievalAgentBusy = true;
+    state.retrievalAgentMessage = decision === "approve" ? "正在启动真实多源检索..." : "";
+    renderRetrievalAgentSurface();
+    const result = await postJSON(
+      `/api/library/${state.libraryId}/retrieval/guided-search-jobs/${encodeURIComponent(state.retrievalGuidedJobId)}/agent-approvals`,
+      { action_id: actionId, decision }
+    );
+    applyRetrievalAgentPayload(result);
+    if (decision === "approve") scheduleRetrievalAgentPoll(state.retrievalGuidedJobId, 300);
+  } catch (error) {
+    state.retrievalAgentMessage = error.message;
+  } finally {
+    state.retrievalAgentBusy = false;
+    renderRetrievalAgentSurface();
+  }
+}
+
+async function interruptRetrievalAgent() {
+  if (!state.retrievalGuidedJobId) return;
+  try {
+    const result = await postJSON(
+      `/api/library/${state.libraryId}/retrieval/guided-search-jobs/${encodeURIComponent(state.retrievalGuidedJobId)}/agent/interrupt`,
+      { scope: "turn" }
+    );
+    applyRetrievalAgentPayload(result);
+    state.retrievalAgentMessage = "已中断本轮智能体处理。";
+  } catch (error) {
+    state.retrievalAgentMessage = error.message;
+  } finally {
+    renderRetrievalAgentSurface();
+  }
+}
+
+async function updateRetrievalAgentMemory(memoryId, status) {
+  try {
+    await postJSON(
+      `/api/library/${state.libraryId}/retrieval/agent-memory/${encodeURIComponent(memoryId)}`,
+      { status },
+      "PATCH"
+    );
+    await loadRetrievalAgentState(state.retrievalGuidedJobId, { silent: true });
+  } catch (error) {
+    state.retrievalAgentMessage = error.message;
+    renderRetrievalAgentSurface();
+  }
+}
+
+async function deleteRetrievalAgentMemory(memoryId) {
+  try {
+    await deleteJSON(`/api/library/${state.libraryId}/retrieval/agent-memory/${encodeURIComponent(memoryId)}`);
+    await loadRetrievalAgentState(state.retrievalGuidedJobId, { silent: true });
+  } catch (error) {
+    state.retrievalAgentMessage = error.message;
+    renderRetrievalAgentSurface();
+  }
+}
+
+async function submitRetrievalAgentFeedback(candidateId, feedbackType) {
+  if (!state.retrievalGuidedJobId || !candidateId || !feedbackType) return;
+  try {
+    const result = await postJSON(
+      `/api/library/${state.libraryId}/retrieval/guided-search-jobs/${encodeURIComponent(state.retrievalGuidedJobId)}/candidate-feedback`,
+      { candidate_id: candidateId, feedback_type: feedbackType }
+    );
+    applyRetrievalAgentPayload(result);
+  } catch (error) {
+    state.retrievalAgentMessage = error.message;
+  } finally {
+    renderRetrievalAgentSurface();
   }
 }
 
@@ -4491,8 +5179,13 @@ async function loadLatestRetrievalGuidedJob(options = {}) {
     const shouldRestore = retrievalBackgroundJobIsActive(job) || !state.retrievalCandidates.length || String(job.topic || "") === String(state.retrievalQuery || "");
     const applied = shouldRestore ? applyRetrievalGuidedJob(job) : false;
     if (applied) {
-      await loadRetrievalGuidedCandidates(job.job_id, { silent: true });
-      if (retrievalBackgroundJobIsActive(job)) scheduleRetrievalGuidedPoll(job.job_id);
+      const route = normalizeRetrievalSearchRoute(job.search_route || job.options?.search_route);
+      if (route === "agent") {
+        await loadRetrievalAgentState(job.job_id, { silent: true });
+      } else {
+        await loadRetrievalGuidedCandidates(job.job_id, { silent: true });
+        if (retrievalBackgroundJobIsActive(job)) scheduleRetrievalGuidedPoll(job.job_id);
+      }
     }
   } catch (error) {
     if (!options.silent) state.addItemMessage = error.message;
@@ -8849,6 +9542,7 @@ async function loadRetrievalWorkspaceData() {
   await loadRetrievalSummary({ silent: true });
   await loadRetrievalSources({ silent: true });
   await loadRetrievalModelStatus({ silent: true });
+  await loadRetrievalAgentStatus({ silent: true });
   await loadRetrievalLocalPaths({ silent: true });
   await loadRetrievalHttpJsonTemplates({ silent: true });
   await loadRetrievalHttpJsonConfig({ silent: true });

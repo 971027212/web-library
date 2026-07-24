@@ -30,6 +30,8 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from . import app_store
 from .citation_export import CitationExportError, export_citations, export_filename
 from .codex_agent import (
+    run_codex_connectivity_probe,
+    run_codex_prompt,
     run_reading_chat_turn,
     recommend_matrix_fields,
     run_reading_matrix_for_item,
@@ -110,6 +112,21 @@ from .retrieval.providers import (
     use_ai_pixel_config,
 )
 from .retrieval.rehearsal import write_retrieval_rehearsal_kit
+from .retrieval_agent import (
+    apply_decision_to_state,
+    build_agent_prompt,
+    coverage_state_from_guided,
+    default_agent_state,
+    enforce_clarification_before_search,
+    feedback_summary,
+    mark_turn_failed,
+    mark_turn_running,
+    merge_intent_model,
+    normalize_agent_decision,
+    normalize_agent_state,
+    update_pending_action,
+)
+from . import retrieval_agent_store
 from .semantic_tags import normalize_hash_tag, stable_tag_color
 from .sources import (
     SourceError,
@@ -130,6 +147,8 @@ RETRIEVAL_BATCH_LOCK = threading.Lock()
 RUNNING_RETRIEVAL_BATCHES: set[str] = set()
 RETRIEVAL_GUIDED_LOCK = threading.Lock()
 RUNNING_RETRIEVAL_GUIDED_JOBS: set[str] = set()
+RETRIEVAL_AGENT_LOCK = threading.Lock()
+RUNNING_RETRIEVAL_AGENT_TURNS: set[str] = set()
 RETRIEVAL_BACKGROUND_LOCK = threading.Lock()
 RUNNING_RETRIEVAL_QUERY_PLAN_JOBS: set[str] = set()
 RUNNING_RETRIEVAL_AI_SCORING_JOBS: set[str] = set()
@@ -11655,6 +11674,442 @@ def create_app() -> Flask:
         thread = threading.Thread(target=execute_retrieval_guided_job, args=(library_id, job_id), daemon=True)
         thread.start()
 
+    def retrieval_agent_job(library_id: str, job_id: str) -> dict[str, Any]:
+        job = app_store.retrieval_guided_job(library_id, job_id)
+        if str(job.get("search_route") or "") != "agent":
+            raise ValueError("该任务不是智能体检索任务。")
+        return job
+
+    def retrieval_agent_status_for_library(
+        library_id: str,
+        *,
+        check_runtime: bool = False,
+    ) -> dict[str, Any]:
+        library = library_or_404(library_id)
+        codex_config = api_config_codex_for_library(library_id)
+        missing = [
+            label
+            for key, label in (
+                ("model", "Codex 模型"),
+                ("base_url", "Codex Base URL"),
+                ("api_key", "Codex API Key"),
+            )
+            if not str(codex_config.get(key) or "").strip()
+        ]
+        if missing:
+            return {
+                "ready": False,
+                "status": "not_configured",
+                "message": f"Codex SDK 未就绪：请先配置{'、'.join(missing)}。",
+                "missing": missing,
+                "checked": False,
+            }
+        payload = {
+            "ready": True,
+            "status": "configured",
+            "message": "Codex SDK 配置已就绪。",
+            "missing": [],
+            "checked": False,
+            "model": str(codex_config.get("model") or ""),
+            "base_url": str(codex_config.get("base_url") or ""),
+        }
+        if not check_runtime:
+            return payload
+        probe = run_codex_connectivity_probe(library=library, codex_config=codex_config)
+        return {
+            **payload,
+            "ready": probe.get("ok") is True,
+            "status": "ready" if probe.get("ok") is True else "runtime_error",
+            "message": str(probe.get("message") or ""),
+            "checked": True,
+            "diagnostics": probe.get("diagnostics") if isinstance(probe.get("diagnostics"), dict) else {},
+        }
+
+    def retrieval_agent_candidate_title(candidate: dict[str, Any]) -> str:
+        item = candidate.get("item") if isinstance(candidate.get("item"), dict) else {}
+        fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+        return str(candidate.get("title") or fields.get("title") or "").strip()
+
+    def retrieval_agent_candidate_summary(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "candidate_id": str(
+                    candidate.get("stored_candidate_id")
+                    or candidate.get("candidate_id")
+                    or retrieval_batch_candidate_key(candidate)
+                ),
+                "title": retrieval_agent_candidate_title(candidate),
+                "source": str(candidate.get("source") or ""),
+                "year": str(candidate.get("year") or ""),
+                "resource_type": str(candidate.get("resource_type") or ""),
+            }
+            for candidate in candidates[:40]
+            if isinstance(candidate, dict)
+        ]
+
+    def sync_retrieval_agent_state_with_job(
+        library_id: str,
+        job: dict[str, Any],
+        state: dict[str, Any],
+        *,
+        candidates_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        current = normalize_agent_state(state)
+        display = candidates_result if isinstance(candidates_result, dict) else {}
+        run_ids = [str(item) for item in job.get("run_ids") or [] if str(item or "").strip()]
+        coverage = display.get("coverage") if isinstance(display.get("coverage"), dict) else job.get("coverage")
+        if run_ids:
+            current["coverage_state"] = coverage_state_from_guided(
+                coverage,
+                run_ids=run_ids,
+                source_stats=job.get("source_stats") if isinstance(job.get("source_stats"), dict) else {},
+            )
+        job_status = str(job.get("status") or "")
+        thread_status = str((current.get("thread") or {}).get("thread_status") or "")
+        changed = False
+        if job_status in {"completed", "partial"} and thread_status == "searching":
+            current["thread"]["thread_status"] = "waiting_user"
+            for item in current.get("pending_actions") or []:
+                if item.get("status") == "approved":
+                    item["status"] = "executed"
+                    item["updated_at"] = now_iso()
+            changed = True
+        elif job_status == "failed" and thread_status == "searching":
+            current["thread"]["thread_status"] = "failed"
+            current["thread"]["last_error"] = str(job.get("error") or "联网检索失败。")
+            changed = True
+        elif job_status == "canceled" and thread_status == "searching":
+            current["thread"]["thread_status"] = "interrupted"
+            changed = True
+        if changed:
+            current["updated_at"] = now_iso()
+            retrieval_agent_store.upsert_session(library_id, str(job["job_id"]), current)
+        return current
+
+    def retrieval_agent_state_payload(
+        library_id: str,
+        job_id: str,
+        *,
+        include_candidates: bool = True,
+    ) -> dict[str, Any]:
+        job = retrieval_agent_job(library_id, job_id)
+        session = retrieval_agent_store.get_session(library_id, job_id)
+        state = normalize_agent_state(session.get("state") if session else default_agent_state())
+        feedback = retrieval_agent_store.list_feedback(library_id, job_id)
+        current_feedback = feedback_summary(feedback)
+        if current_feedback != state.get("feedback_summary"):
+            state["feedback_summary"] = current_feedback
+            state["updated_at"] = now_iso()
+            retrieval_agent_store.upsert_session(library_id, job_id, state)
+        candidates_result: dict[str, Any] = {"candidates": [], "coverage": job.get("coverage") or {}}
+        if include_candidates and job.get("run_ids"):
+            candidates_result = guided_search_candidates_for_display(
+                library_id,
+                job_id,
+                use_ai_evaluation=False,
+                limit=500,
+            )
+            job = candidates_result.get("job") if isinstance(candidates_result.get("job"), dict) else job
+        state = sync_retrieval_agent_state_with_job(
+            library_id,
+            job,
+            state,
+            candidates_result=candidates_result,
+        )
+        latest_turn = retrieval_agent_store.latest_turn(library_id, job_id)
+        if latest_turn and latest_turn.get("status") == "queued":
+            start_retrieval_agent_turn_worker(library_id, job_id, str(latest_turn["turn_id"]))
+        elif latest_turn and latest_turn.get("status") == "running":
+            with RETRIEVAL_AGENT_LOCK:
+                active_locally = str(latest_turn["turn_id"]) in RUNNING_RETRIEVAL_AGENT_TURNS
+            if not active_locally:
+                retrieval_agent_store.update_turn(
+                    library_id,
+                    job_id,
+                    str(latest_turn["turn_id"]),
+                    status="queued",
+                    result=latest_turn.get("result") if isinstance(latest_turn.get("result"), dict) else {},
+                )
+                start_retrieval_agent_turn_worker(library_id, job_id, str(latest_turn["turn_id"]))
+        memory = retrieval_agent_store.list_memory(library_id)
+        state["memory_policy"]["library_enabled"] = any(item.get("status") == "enabled" for item in memory)
+        return {
+            "job": job,
+            "agent_state": state,
+            "messages": retrieval_agent_store.list_messages(library_id, job_id),
+            "latest_turn": retrieval_agent_store.latest_turn(library_id, job_id),
+            "memory": memory,
+            "feedback": feedback,
+            "candidates": candidates_result.get("candidates") if include_candidates else [],
+            "coverage": candidates_result.get("coverage") or job.get("coverage") or {},
+            "source_stats": job.get("source_stats") if isinstance(job.get("source_stats"), dict) else {},
+        }
+
+    def execute_retrieval_agent_turn(library_id: str, job_id: str, turn_id: str) -> None:
+        try:
+            turn = retrieval_agent_store.get_turn(library_id, job_id, turn_id)
+            if not turn or turn.get("status") != "queued":
+                return
+            job = retrieval_agent_job(library_id, job_id)
+            session = retrieval_agent_store.get_session(library_id, job_id)
+            state = normalize_agent_state(session.get("state") if session else default_agent_state())
+            state = mark_turn_running(state, turn_id)
+            retrieval_agent_store.upsert_session(library_id, job_id, state)
+            retrieval_agent_store.update_turn(library_id, job_id, turn_id, status="running")
+            app_store.append_retrieval_guided_event(
+                library_id,
+                job_id,
+                "智能体正在理解本轮要求。",
+                kind="agent",
+                data={"turn_id": turn_id},
+            )
+            status = retrieval_agent_status_for_library(library_id)
+            if not status.get("ready"):
+                raise RuntimeError(str(status.get("message") or "Codex SDK 未就绪。"))
+            display = (
+                guided_search_candidates_for_display(library_id, job_id, use_ai_evaluation=False, limit=100)
+                if job.get("run_ids")
+                else {"candidates": []}
+            )
+            feedback = retrieval_agent_store.list_feedback(library_id, job_id)
+            state["feedback_summary"] = feedback_summary(feedback)
+            enabled_memory = retrieval_agent_store.list_memory(library_id, status="enabled")
+            messages = retrieval_agent_store.list_messages(library_id, job_id)
+            prompt = build_agent_prompt(
+                state=state,
+                messages=messages,
+                enabled_library_memory=enabled_memory,
+                selected_sources=[str(item) for item in job.get("sources") or []],
+                candidate_summary=retrieval_agent_candidate_summary(list(display.get("candidates") or [])),
+            )
+            result = run_codex_prompt(
+                library=library_or_404(library_id),
+                codex_config=api_config_codex_for_library(library_id),
+                prompt=prompt,
+                include_agentic_rag_skill=False,
+                ephemeral=True,
+                read_only=True,
+            )
+            decision = enforce_clarification_before_search(
+                normalize_agent_decision(str(result.get("assistant_text") or "")),
+                state=state,
+                messages=messages,
+            )
+            current_turn = retrieval_agent_store.get_turn(library_id, job_id, turn_id)
+            if not current_turn or current_turn.get("status") != "running":
+                return
+            next_state = apply_decision_to_state(state, decision, turn_id=turn_id)
+            existing_memories = retrieval_agent_store.list_memory(library_id)
+            existing_memory_keys = {
+                json.dumps(item.get("content") or {}, ensure_ascii=False, sort_keys=True)
+                for item in existing_memories
+            }
+            memory_ids: list[str] = []
+            for suggestion in decision.get("memory_suggestions") or []:
+                content = suggestion.get("content") if isinstance(suggestion.get("content"), dict) else {}
+                memory_key = json.dumps(content, ensure_ascii=False, sort_keys=True)
+                if not content or memory_key in existing_memory_keys:
+                    continue
+                memory = retrieval_agent_store.create_memory_suggestion(
+                    library_id,
+                    kind=str(suggestion.get("kind") or "preference"),
+                    content=content,
+                    source_job_id=job_id,
+                )
+                memory_ids.append(str(memory.get("memory_id") or ""))
+                existing_memory_keys.add(memory_key)
+            assistant_message = retrieval_agent_store.add_message(
+                library_id,
+                job_id,
+                "assistant",
+                str(decision.get("assistant_message") or ""),
+                metadata={
+                    "action": decision.get("action"),
+                    "turn_id": turn_id,
+                    "codex_turn_id": result.get("turn_id"),
+                    "memory_suggestion_ids": memory_ids,
+                },
+            )
+            retrieval_agent_store.upsert_session(library_id, job_id, next_state)
+            retrieval_agent_store.update_turn(
+                library_id,
+                job_id,
+                turn_id,
+                status="completed",
+                result={
+                    "decision": decision,
+                    "assistant_message_id": assistant_message.get("message_id"),
+                    "codex_turn_id": result.get("turn_id"),
+                    "usage": result.get("usage"),
+                },
+            )
+            app_store.append_retrieval_guided_event(
+                library_id,
+                job_id,
+                "智能体已更新当前理解。"
+                + ("请确认检索计划后开始联网。" if decision.get("action") == "PROPOSE_SEARCH" else ""),
+                kind="agent",
+                data={"turn_id": turn_id, "action": decision.get("action")},
+            )
+        except Exception as exc:  # noqa: BLE001 - persist agent failures for UI recovery
+            current_turn = retrieval_agent_store.get_turn(library_id, job_id, turn_id)
+            if current_turn and current_turn.get("status") == "interrupted":
+                return
+            try:
+                session = retrieval_agent_store.get_session(library_id, job_id)
+                state = mark_turn_failed(
+                    session.get("state") if session else default_agent_state(),
+                    turn_id,
+                    str(exc),
+                )
+                retrieval_agent_store.upsert_session(library_id, job_id, state)
+                retrieval_agent_store.update_turn(
+                    library_id,
+                    job_id,
+                    turn_id,
+                    status="failed",
+                    error=str(exc),
+                )
+                retrieval_agent_store.add_message(
+                    library_id,
+                    job_id,
+                    "system",
+                    f"智能体处理失败：{exc}",
+                    metadata={"turn_id": turn_id, "error": True},
+                )
+                app_store.append_retrieval_guided_event(
+                    library_id,
+                    job_id,
+                    f"智能体处理失败：{exc}",
+                    kind="error",
+                    data={"turn_id": turn_id},
+                )
+            except Exception:
+                pass
+        finally:
+            with RETRIEVAL_AGENT_LOCK:
+                RUNNING_RETRIEVAL_AGENT_TURNS.discard(turn_id)
+
+    def start_retrieval_agent_turn_worker(library_id: str, job_id: str, turn_id: str) -> None:
+        with RETRIEVAL_AGENT_LOCK:
+            if turn_id in RUNNING_RETRIEVAL_AGENT_TURNS:
+                return
+            RUNNING_RETRIEVAL_AGENT_TURNS.add(turn_id)
+        if os.environ.get("WEB_LIBRARY_RETRIEVAL_AGENT_INLINE", "").strip().lower() in {"1", "true", "yes"}:
+            execute_retrieval_agent_turn(library_id, job_id, turn_id)
+            return
+        thread = threading.Thread(
+            target=execute_retrieval_agent_turn,
+            args=(library_id, job_id, turn_id),
+            daemon=True,
+        )
+        thread.start()
+
+    def retrieval_agent_plan_to_guided_plan(
+        library_id: str,
+        job: dict[str, Any],
+        action: dict[str, Any],
+        state: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        preview = action.get("plan_preview") if isinstance(action.get("plan_preview"), dict) else {}
+        intents = preview.get("query_intents") if isinstance(preview.get("query_intents"), list) else []
+        selected_sources = [str(item).strip().lower() for item in job.get("sources") or [] if str(item).strip()]
+        registry = retrieval_provider_registry_for_library(library_id)
+        budget = state.get("budget") if isinstance(state.get("budget"), dict) else {}
+        query_limit = max(3, min(safe_int(budget.get("max_queries_per_round")) or 18, 40))
+        existing_plan = job.get("plan") if isinstance(job.get("plan"), dict) else {}
+        existing_queries = [
+            item for item in existing_plan.get("queries") or [] if isinstance(item, dict)
+        ]
+        seen = {
+            str(item.get("query_text") or item.get("query") or "").strip().casefold()
+            for item in existing_queries
+        }
+        new_queries: list[dict[str, Any]] = []
+        new_groups: list[dict[str, Any]] = []
+        for intent in intents:
+            if not isinstance(intent, dict):
+                continue
+            material = normalized_material_type(intent.get("material_type")) or "paper"
+            supported = default_guided_sources_for_materials(registry, [material])
+            sources = [source for source in selected_sources if source in supported]
+            if not sources:
+                sources = list(selected_sources)
+            group_queries: list[str] = []
+            for keyword in intent.get("keywords") or []:
+                query = re.sub(r"\s+", " ", str(keyword or "")).strip()
+                key = query.casefold()
+                if not query or key in seen:
+                    continue
+                seen.add(key)
+                group_queries.append(query)
+                new_queries.append(
+                    {
+                        "query": query,
+                        "query_text": query,
+                        "intent": str(intent.get("purpose") or material),
+                        "reason": "agent_decision",
+                        "resource_type": material,
+                        "sources": sources,
+                    }
+                )
+                if len(new_queries) >= query_limit:
+                    break
+            if group_queries:
+                new_groups.append(
+                    {
+                        "resource_type": material,
+                        "language": "zh" if any("\u4e00" <= char <= "\u9fff" for char in "".join(group_queries)) else "en",
+                        "queries": group_queries,
+                        "sources": sources,
+                        "reason": "agent_decision",
+                        "planning_status": "ai",
+                        "planning_message": str(intent.get("purpose") or ""),
+                    }
+                )
+            if len(new_queries) >= query_limit:
+                break
+        if not new_queries:
+            raise ValueError("确认的智能体检索计划没有新的有效检索词。")
+        strategy = existing_plan.get("strategy") if isinstance(existing_plan.get("strategy"), dict) else guided_strategy(str(job.get("mode") or "quality"))
+        plan = {
+            **existing_plan,
+            "input_text": str(job.get("input_text") or job.get("topic") or ""),
+            "normalized_topic": str(
+                (state.get("intent_model") or {}).get("normalized_topic")
+                or (state.get("intent_model") or {}).get("topic")
+                or job.get("topic")
+                or ""
+            ),
+            "queries": [*existing_queries, *new_queries],
+            "query_groups": [
+                *[item for item in existing_plan.get("query_groups") or [] if isinstance(item, dict)],
+                *new_groups,
+            ],
+            "query_count": len(existing_queries) + len(new_queries),
+            "strategy": strategy,
+            "planner_version": "agent-v2",
+            "search_route": "agent",
+            "ai_enhancement": {
+                "status": "applied",
+                "provider": "codex",
+                "message": "Codex 形成语义检索意图，后端按资料类型解析真实数据源。",
+            },
+        }
+        options = dict(job.get("options") if isinstance(job.get("options"), dict) else {})
+        intent_model = state.get("intent_model") if isinstance(state.get("intent_model"), dict) else {}
+        time_range = intent_model.get("time_range") if isinstance(intent_model.get("time_range"), dict) else {}
+        for key in ("start_year", "end_year"):
+            if time_range.get(key):
+                options[key] = time_range[key]
+        options["material_types"] = [
+            str(item) for item in intent_model.get("material_types") or job.get("material_types") or []
+        ]
+        limit_per_source = safe_int(options.get("limit_per_source")) or 8
+        source_limits = options.get("source_limits") if isinstance(options.get("source_limits"), dict) else {}
+        apply_guided_plan_limit(plan, limit_per_source, source_limits)
+        return plan, options
+
     def execute_retrieval_search_job(library_id: str, job_id: str) -> None:
         try:
             with RETRIEVAL_BACKGROUND_LOCK:
@@ -12569,18 +13024,22 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
     def guided_search_request_from_payload(library_id: str, payload: dict[str, Any], *, default_route: str = "legacy") -> dict[str, Any]:
-        topic = str(payload.get("topic") or payload.get("query") or payload.get("input_text") or "").strip()
-        if not topic:
-            raise ValueError("检索主题不能为空。")
-        library_or_404(library_id)
-        mode = normalize_guided_search_mode(payload.get("mode"))
-        time_range = normalize_guided_time_range(payload.get("time_range"), mode)
-        material_types = normalize_guided_material_types(payload.get("material_types"))
         route_was_provided = "search_route" in payload or "route" in payload
         search_route = normalize_retrieval_search_route(
             payload.get("search_route") or payload.get("route"),
             default="natural_language" if route_was_provided else default_route,
         )
+        empty_agent_task = search_route == "agent" and payload.get("empty_task") is True
+        topic = str(payload.get("topic") or payload.get("query") or payload.get("input_text") or "").strip()
+        if not topic:
+            if empty_agent_task:
+                topic = "待确认研究需求"
+            else:
+                raise ValueError("检索主题不能为空。")
+        library_or_404(library_id)
+        mode = normalize_guided_search_mode(payload.get("mode"))
+        time_range = normalize_guided_time_range(payload.get("time_range"), mode)
+        material_types = normalize_guided_material_types(payload.get("material_types"))
         expansion_level = normalize_retrieval_expansion_level(payload.get("expansion_level"))
         language_policy = normalize_retrieval_language_policy(payload.get("language_policy"))
         registry = retrieval_provider_registry_for_library(library_id)
@@ -12602,14 +13061,13 @@ def create_app() -> Flask:
         options.update(
             {
                 "search_route": search_route,
-                "input_text": topic,
+                "input_text": "" if empty_agent_task else topic,
+                "empty_task": empty_agent_task,
                 "planner_version": "v4" if search_route in {"keyword", "natural_language", "agent"} else "legacy",
                 "expansion_level": expansion_level,
                 "language_policy": language_policy,
             }
         )
-        if search_route == "agent":
-            raise ValueError("智能体检索实验入口已准备 skill/CLI 工具层，本接口暂不直接启动 agent。")
         if search_route == "natural_language":
             with use_ai_pixel_config(api_config_model_for_library(library_id)):
                 model_status = retrieval_model_status()
@@ -12627,6 +13085,7 @@ def create_app() -> Flask:
             "options": options,
             "limit_per_source": limit_per_source,
             "source_limits": source_limits,
+            "empty_agent_task": empty_agent_task,
         }
 
     @app.post("/api/library/<library_id>/retrieval/guided-search-plan")
@@ -12634,6 +13093,8 @@ def create_app() -> Flask:
         payload = request.get_json(silent=True) or {}
         try:
             parsed = guided_search_request_from_payload(library_id, payload, default_route="natural_language")
+            if parsed["search_route"] == "agent":
+                raise ValueError("智能体检索通过对话形成计划，请在智能体工作台发送消息。")
             plan = guided_search_plan_for_library(
                 library_id,
                 topic=parsed["topic"],
@@ -12671,7 +13132,42 @@ def create_app() -> Flask:
             if plan and isinstance(plan.get("queries"), list) and plan.get("queries"):
                 apply_guided_plan_limit(plan, parsed["limit_per_source"], parsed["source_limits"])
                 job = app_store.update_retrieval_guided_job(library_id, str(job.get("job_id") or ""), plan=plan)
-            start_retrieval_guided_worker(library_id, str(job.get("job_id") or ""))
+            if parsed["search_route"] == "agent":
+                state = default_agent_state()
+                state["intent_model"] = merge_intent_model(
+                    state.get("intent_model"),
+                    {
+                        "topic": "" if parsed["empty_agent_task"] else parsed["topic"],
+                        "material_types": parsed["material_types"],
+                        "time_range": parsed["time_range"],
+                        "preferred_sources": parsed["source_names"],
+                        "confidence": 0.0 if parsed["empty_agent_task"] else 0.15,
+                    },
+                )
+                state["thread"]["thread_status"] = "waiting_user"
+                state["updated_at"] = now_iso()
+                retrieval_agent_store.upsert_session(
+                    library_id,
+                    str(job.get("job_id") or ""),
+                    state,
+                )
+                job = app_store.update_retrieval_guided_job(
+                    library_id,
+                    str(job.get("job_id") or ""),
+                    status="draft",
+                    progress={
+                        **(job.get("progress") if isinstance(job.get("progress"), dict) else {}),
+                        "stage": "conversation",
+                    },
+                )
+                app_store.append_retrieval_guided_event(
+                    library_id,
+                    str(job.get("job_id") or ""),
+                    "智能体会话已创建，等待理解用户需求。",
+                    kind="agent",
+                )
+            else:
+                start_retrieval_guided_worker(library_id, str(job.get("job_id") or ""))
             return jsonify({"ok": True, "job": app_store.retrieval_guided_job(library_id, str(job.get("job_id") or ""))})
         except (SourceError, RetrievalError, ValueError) as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
@@ -12680,7 +13176,27 @@ def create_app() -> Flask:
     def api_latest_retrieval_guided_search_job(library_id: str):
         try:
             library_or_404(library_id)
-            job = app_store.latest_retrieval_guided_job(library_id)
+            search_route = str(request.args.get("search_route") or "").strip()
+            if search_route:
+                job = next(
+                    (
+                        item
+                        for item in app_store.recent_retrieval_guided_jobs(library_id, limit=100)
+                        if str(
+                            item.get("search_route")
+                            or (
+                                item.get("options")
+                                if isinstance(item.get("options"), dict)
+                                else {}
+                            ).get("search_route")
+                            or ""
+                        )
+                        == search_route
+                    ),
+                    None,
+                )
+            else:
+                job = app_store.latest_retrieval_guided_job(library_id)
             if job and job.get("status") in {"queued", "running"}:
                 start_retrieval_guided_worker(library_id, str(job.get("job_id") or ""))
             return jsonify({"ok": True, "job": job})
@@ -12713,6 +13229,312 @@ def create_app() -> Flask:
             return jsonify({"ok": True, **result})
         except (SourceError, ValueError) as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.get("/api/library/<library_id>/retrieval/agent/status")
+    def api_retrieval_agent_status(library_id: str):
+        try:
+            check_runtime = request.args.get("check", "").strip().lower() in {"1", "true", "yes"}
+            return jsonify(
+                {
+                    "ok": True,
+                    **retrieval_agent_status_for_library(
+                        library_id,
+                        check_runtime=check_runtime,
+                    ),
+                }
+            )
+        except (SourceError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.get("/api/library/<library_id>/retrieval/guided-search-jobs/<job_id>/agent/state")
+    def api_retrieval_agent_state(library_id: str, job_id: str):
+        try:
+            return jsonify(
+                {
+                    "ok": True,
+                    **retrieval_agent_state_payload(
+                        library_id,
+                        job_id,
+                        include_candidates=True,
+                    ),
+                }
+            )
+        except (SourceError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+
+    @app.post("/api/library/<library_id>/retrieval/guided-search-jobs/<job_id>/agent-turns")
+    def api_retrieval_agent_turn(library_id: str, job_id: str):
+        payload = request.get_json(silent=True) or {}
+        content = str(payload.get("message") or payload.get("content") or "").strip()
+        if not content:
+            return jsonify({"ok": False, "error": "请输入要告诉智能体的内容。"}), 400
+        try:
+            job = retrieval_agent_job(library_id, job_id)
+            status = retrieval_agent_status_for_library(library_id)
+            if not status.get("ready"):
+                return jsonify({"ok": False, "error": status.get("message"), "agent_status": status}), 503
+            active_turn = retrieval_agent_store.latest_turn(library_id, job_id)
+            if active_turn and active_turn.get("status") in {"queued", "running"}:
+                raise ValueError("智能体正在处理上一条消息，请稍候。")
+            existing_messages = retrieval_agent_store.list_messages(library_id, job_id)
+            job_options = job.get("options") if isinstance(job.get("options"), dict) else {}
+            if not existing_messages and job_options.get("empty_task") is True:
+                job = app_store.update_retrieval_guided_job(
+                    library_id,
+                    job_id,
+                    topic=content,
+                    options={
+                        **job_options,
+                        "input_text": content,
+                        "empty_task": False,
+                    },
+                )
+            message = retrieval_agent_store.add_message(
+                library_id,
+                job_id,
+                "user",
+                content,
+                visibility="session_only",
+            )
+            turn = retrieval_agent_store.create_turn(
+                library_id,
+                job_id,
+                str(message.get("message_id") or ""),
+            )
+            session = retrieval_agent_store.get_session(library_id, job_id)
+            state = mark_turn_running(
+                session.get("state") if session else default_agent_state(),
+                str(turn["turn_id"]),
+            )
+            retrieval_agent_store.upsert_session(library_id, job_id, state)
+            start_retrieval_agent_turn_worker(library_id, job_id, str(turn["turn_id"]))
+            return (
+                jsonify(
+                    {
+                        "ok": True,
+                        "turn": retrieval_agent_store.get_turn(
+                            library_id,
+                            job_id,
+                            str(turn["turn_id"]),
+                        ),
+                        "message": message,
+                    }
+                ),
+                202,
+            )
+        except (SourceError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.patch("/api/library/<library_id>/retrieval/guided-search-jobs/<job_id>/agent/intent")
+    def api_retrieval_agent_intent(library_id: str, job_id: str):
+        payload = request.get_json(silent=True) or {}
+        patch = payload.get("intent_patch") if isinstance(payload.get("intent_patch"), dict) else payload
+        try:
+            retrieval_agent_job(library_id, job_id)
+            session = retrieval_agent_store.get_session(library_id, job_id)
+            state = normalize_agent_state(session.get("state") if session else default_agent_state())
+            state["intent_model"] = merge_intent_model(state.get("intent_model"), patch)
+            state["thread"]["thread_status"] = "waiting_user"
+            state["updated_at"] = now_iso()
+            retrieval_agent_store.upsert_session(library_id, job_id, state)
+            retrieval_agent_store.add_message(
+                library_id,
+                job_id,
+                "system",
+                "用户手动更新了当前理解。",
+                metadata={"intent_patch": patch},
+            )
+            app_store.append_retrieval_guided_event(
+                library_id,
+                job_id,
+                "用户手动更新了智能体当前理解。",
+                kind="agent",
+            )
+            return jsonify({"ok": True, **retrieval_agent_state_payload(library_id, job_id)})
+        except (SourceError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.post("/api/library/<library_id>/retrieval/guided-search-jobs/<job_id>/agent-approvals")
+    def api_retrieval_agent_approval(library_id: str, job_id: str):
+        payload = request.get_json(silent=True) or {}
+        action_id = str(payload.get("action_id") or "").strip()
+        decision = str(payload.get("decision") or "").strip().lower()
+        if not action_id or decision not in {"approve", "reject"}:
+            return jsonify({"ok": False, "error": "请提供 action_id 和 approve/reject。"}), 400
+        try:
+            job = retrieval_agent_job(library_id, job_id)
+            session = retrieval_agent_store.get_session(library_id, job_id)
+            state = normalize_agent_state(session.get("state") if session else default_agent_state())
+            if decision == "reject":
+                state, _ = update_pending_action(state, action_id, "rejected")
+                retrieval_agent_store.upsert_session(library_id, job_id, state)
+                retrieval_agent_store.add_message(
+                    library_id,
+                    job_id,
+                    "system",
+                    "用户暂不执行这轮联网检索计划。",
+                    metadata={"action_id": action_id},
+                )
+                return jsonify({"ok": True, **retrieval_agent_state_payload(library_id, job_id)})
+            if str(job.get("status") or "") in {"queued", "running"}:
+                raise ValueError("当前联网检索仍在执行；可以继续聊天，待本轮完成后再确认补检。")
+            budget = state.get("budget") if isinstance(state.get("budget"), dict) else {}
+            if safe_int(budget.get("search_rounds_used")) >= safe_int(budget.get("max_search_rounds")):
+                raise ValueError("已达到当前智能体任务的最大检索轮数。")
+            state, action = update_pending_action(state, action_id, "approved")
+            plan, options = retrieval_agent_plan_to_guided_plan(library_id, job, action, state)
+            budget["search_rounds_used"] = safe_int(budget.get("search_rounds_used")) + 1
+            state["budget"] = budget
+            state["thread"]["thread_status"] = "searching"
+            state["updated_at"] = now_iso()
+            progress = {
+                **(job.get("progress") if isinstance(job.get("progress"), dict) else {}),
+                "stage": "queued",
+                "total_queries": len(plan.get("queries") or []),
+                "current_query": "",
+            }
+            app_store.update_retrieval_guided_job(
+                library_id,
+                job_id,
+                status="queued",
+                options=options,
+                plan=plan,
+                progress=progress,
+                error="",
+            )
+            retrieval_agent_store.upsert_session(library_id, job_id, state)
+            app_store.append_retrieval_guided_event(
+                library_id,
+                job_id,
+                f"用户已确认第 {budget['search_rounds_used']} 轮联网检索。",
+                kind="agent",
+                data={"action_id": action_id},
+            )
+            start_retrieval_guided_worker(library_id, job_id)
+            return jsonify({"ok": True, **retrieval_agent_state_payload(library_id, job_id)})
+        except (SourceError, RetrievalError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.post("/api/library/<library_id>/retrieval/guided-search-jobs/<job_id>/agent/interrupt")
+    def api_retrieval_agent_interrupt(library_id: str, job_id: str):
+        payload = request.get_json(silent=True) or {}
+        try:
+            job = retrieval_agent_job(library_id, job_id)
+            turn = retrieval_agent_store.interrupt_active_turn(library_id, job_id)
+            session = retrieval_agent_store.get_session(library_id, job_id)
+            state = normalize_agent_state(session.get("state") if session else default_agent_state())
+            state["thread"]["thread_status"] = "interrupted"
+            state["thread"]["active_turn_id"] = ""
+            state["thread"]["last_error"] = "用户中断了智能体处理。"
+            state["updated_at"] = now_iso()
+            retrieval_agent_store.upsert_session(library_id, job_id, state)
+            if payload.get("scope") == "all" and str(job.get("status") or "") in {"queued", "running"}:
+                app_store.cancel_retrieval_guided_job(library_id, job_id, "用户中断了智能体联网检索。")
+            return jsonify({"ok": True, "turn": turn, **retrieval_agent_state_payload(library_id, job_id)})
+        except (SourceError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.post("/api/library/<library_id>/retrieval/guided-search-jobs/<job_id>/candidate-feedback")
+    def api_retrieval_agent_candidate_feedback(library_id: str, job_id: str):
+        payload = request.get_json(silent=True) or {}
+        candidate_id = str(payload.get("candidate_id") or "").strip()
+        feedback_type = str(payload.get("feedback_type") or "").strip()
+        try:
+            job = retrieval_agent_job(library_id, job_id)
+            candidates_result = guided_search_candidates_for_display(
+                library_id,
+                job_id,
+                use_ai_evaluation=False,
+                limit=500,
+            )
+            candidate_ids = {
+                str(
+                    candidate.get("stored_candidate_id")
+                    or candidate.get("candidate_id")
+                    or retrieval_batch_candidate_key(candidate)
+                )
+                for candidate in candidates_result.get("candidates") or []
+                if isinstance(candidate, dict)
+            }
+            if candidate_id not in candidate_ids:
+                raise ValueError("候选不存在或不属于当前智能体任务。")
+            feedback = retrieval_agent_store.add_feedback(
+                library_id,
+                job_id,
+                candidate_id,
+                feedback_type,
+                note=str(payload.get("note") or ""),
+            )
+            session = retrieval_agent_store.get_session(library_id, job_id)
+            state = normalize_agent_state(session.get("state") if session else default_agent_state())
+            state["feedback_summary"] = feedback_summary(
+                retrieval_agent_store.list_feedback(library_id, job_id)
+            )
+            if feedback_type == "too_old":
+                criteria = list((state.get("intent_model") or {}).get("quality_criteria") or [])
+                if "优先较新的资料" not in criteria:
+                    criteria.append("优先较新的资料")
+                state["intent_model"] = merge_intent_model(
+                    state.get("intent_model"),
+                    {"quality_criteria": criteria},
+                )
+            elif feedback_type == "useful_code":
+                criteria = list((state.get("intent_model") or {}).get("quality_criteria") or [])
+                if "优先可复现代码" not in criteria:
+                    criteria.append("优先可复现代码")
+                state["intent_model"] = merge_intent_model(
+                    state.get("intent_model"),
+                    {"quality_criteria": criteria},
+                )
+            state["updated_at"] = now_iso()
+            retrieval_agent_store.upsert_session(library_id, job_id, state)
+            app_store.append_retrieval_guided_event(
+                library_id,
+                job_id,
+                f"记录候选反馈：{feedback_type}。",
+                kind="feedback",
+                data={"candidate_id": candidate_id, "feedback_type": feedback_type},
+            )
+            return jsonify({"ok": True, "feedback": feedback, **retrieval_agent_state_payload(library_id, job_id)})
+        except (SourceError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.get("/api/library/<library_id>/retrieval/agent-memory")
+    def api_retrieval_agent_memory(library_id: str):
+        try:
+            library_or_404(library_id)
+            return jsonify({"ok": True, "memory": retrieval_agent_store.list_memory(library_id)})
+        except (SourceError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.patch("/api/library/<library_id>/retrieval/agent-memory/<memory_id>")
+    def api_update_retrieval_agent_memory(library_id: str, memory_id: str):
+        payload = request.get_json(silent=True) or {}
+        try:
+            library_or_404(library_id)
+            status = payload.get("status")
+            if "enabled" in payload:
+                status = "enabled" if payload.get("enabled") is True else "disabled"
+            memory = retrieval_agent_store.update_memory(
+                library_id,
+                memory_id,
+                status=str(status) if status is not None else None,
+                content=payload.get("content") if isinstance(payload.get("content"), dict) else None,
+            )
+            return jsonify({"ok": True, "memory": memory})
+        except (SourceError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.delete("/api/library/<library_id>/retrieval/agent-memory/<memory_id>")
+    def api_delete_retrieval_agent_memory(library_id: str, memory_id: str):
+        try:
+            library_or_404(library_id)
+            deleted = retrieval_agent_store.delete_memory(library_id, memory_id)
+            if not deleted:
+                raise ValueError("记忆不存在。")
+            return jsonify({"ok": True})
+        except (SourceError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
 
     @app.post("/api/library/<library_id>/retrieval/guided-search-jobs/<job_id>/cancel")
     def api_cancel_retrieval_guided_search_job(library_id: str, job_id: str):

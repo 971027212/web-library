@@ -301,6 +301,19 @@ def delete_library_record(library_id: str) -> None:
         conn.execute("DELETE FROM retrieval_batch_items WHERE library_id = ?", (library_id,))
         conn.execute("DELETE FROM retrieval_guided_jobs WHERE library_id = ?", (library_id,))
         conn.execute("DELETE FROM retrieval_custom_sources WHERE library_id = ?", (library_id,))
+        for table in (
+            "retrieval_agent_sessions",
+            "retrieval_agent_messages",
+            "retrieval_agent_turns",
+            "retrieval_agent_memory",
+            "retrieval_agent_feedback",
+        ):
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if exists:
+                conn.execute(f"DELETE FROM {table} WHERE library_id = ?", (library_id,))
         conn.commit()
 
 
@@ -1083,7 +1096,9 @@ def update_retrieval_guided_job(
     library_id: str,
     job_id: str,
     *,
+    topic: str | None = None,
     status: str | None = None,
+    options: dict[str, Any] | None = None,
     plan: dict[str, Any] | None = None,
     coverage: dict[str, Any] | None = None,
     source_stats: dict[str, Any] | None = None,
@@ -1098,9 +1113,20 @@ def update_retrieval_guided_job(
     timestamp = now_iso()
     assignments = ["updated_at = ?"]
     values: list[Any] = [timestamp]
+    if topic is not None:
+        clean_topic = str(topic or "").strip()
+        if not clean_topic:
+            raise ValueError("guided search topic cannot be empty")
+        assignments.append("topic = ?")
+        values.append(clean_topic)
     if status is not None:
         assignments.append("status = ?")
         values.append(str(status))
+        if str(status) in {"queued", "running"}:
+            assignments.append("finished_at = ''")
+    if options is not None:
+        assignments.append("options_json = ?")
+        values.append(json.dumps(options, ensure_ascii=False))
     if plan is not None:
         assignments.append("plan_json = ?")
         values.append(json.dumps(plan, ensure_ascii=False))

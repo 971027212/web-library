@@ -266,9 +266,16 @@ def test_frontend_contains_refined_interaction_hooks() -> None:
     assert "function retrievalGuidedGroupSourcesLabel" in app_js
     assert "规则兜底生成" in app_js
     assert "AI 检索计划已生成。请确认或编辑后再开始检索。" in app_js
-    assert "智能体检索实验入口已在下方说明" in app_js
     assert "function renderAgentRetrievalPanel" in app_js
-    assert "网页端暂未启动 agent" in app_js
+    assert "确认并开始检索" in app_js
+    assert "data-agent-chat-form" in app_js
+    assert "agent-approvals" in app_js
+    assert "candidate-feedback" in app_js
+    assert "只有你确认启用后，未来任务才会使用" in app_js
+    assert 'turnBusy || status.ready === false || state.retrievalAgentBusy' not in app_js
+    assert 'turnBusy || state.retrievalAgentBusy ? "disabled" : ""' in app_js
+    assert 'await loadRetrievalAgentStatus({ check: true, silent: true });' in app_js
+    assert "检查配置并发送" in app_js
     assert "retrieval-route-tabs" in app_css
     assert "grid-template-columns: repeat(2, minmax(72px, 1fr));" in app_css
     assert "guided-source-limit-grid" in app_css
@@ -278,9 +285,21 @@ def test_frontend_contains_refined_interaction_hooks() -> None:
     assert "guided-event-list" in app_css
     assert ".guided-event.success strong" in app_css
     assert "guided-plan-editor" in app_css
-    assert "retrieval-agent-panel" in app_css
+    assert "retrieval-agent-workbench" in app_css
+    assert "retrieval-agent-layout" in app_css
+    assert "智能体会先追问关键条件；回答后再形成检索计划。" in app_js
+    assert "async function startNewRetrievalAgentTask()" in app_js
+    assert 'createRetrievalAgentJob("", { emptyTask: true })' in app_js
+    assert "empty_task: emptyTask" in app_js
+    assert '"新对话已创建"' in app_js
+    assert "请描述这次要检索的内容，智能体会先向你提问。" in app_js
     assert "function delegatedRetrievalSubmitEvent" in app_js
     assert "currentTarget: form" in app_js
+    assert "submitRetrievalAgentMessage(delegatedEvent)" in app_js
+    assert (
+        'if (event.target.matches("[data-agent-chat-form]")) {\n'
+        "      submitRetrievalAgentMessage(event);"
+    ) not in app_js
     assert "submitRetrievalSearch(delegatedEvent)" in app_js
     assert "SIMPLE_RETRIEVAL_SOURCE_CATEGORIES" in app_js
     assert "function renderSimpleRetrievalSourceCategory" in app_js

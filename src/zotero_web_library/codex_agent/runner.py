@@ -274,6 +274,7 @@ def run_codex_prompt(
     prompt: str,
     include_agentic_rag_skill: bool = False,
     ephemeral: bool = True,
+    read_only: bool = False,
 ) -> dict[str, Any]:
     runtime = build_runtime_config(library, codex_config)
     provider = runtime["model_provider"]
@@ -291,11 +292,12 @@ def run_codex_prompt(
         turn_input.append(SkillInput(name="agentic-rag", path=str(skill_path)))
     turn_input.append(TextInput(str(prompt or "")))
 
+    sandbox = Sandbox.read_only if read_only else Sandbox.workspace_write
     with Codex(codex_config_obj) as codex:
         codex.login_api_key(runtime["api_key"])
         thread = codex.thread_start(
             cwd=str(working_dir),
-            sandbox=Sandbox.workspace_write,
+            sandbox=sandbox,
             approval_mode=ApprovalMode.deny_all,
             model=runtime["model"],
             model_provider=provider,
@@ -304,6 +306,7 @@ def run_codex_prompt(
         result = run_thread_turn_with_diagnostics(
             thread,
             turn_input,
+            sandbox=sandbox,
             summary=ReasoningSummary(root="concise"),
         )
     payload = result.to_api_payload()
